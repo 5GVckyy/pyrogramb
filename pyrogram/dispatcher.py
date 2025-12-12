@@ -20,12 +20,11 @@ import asyncio
 import inspect
 import logging
 from collections import OrderedDict
-from typing import Any
 
 import pyrogram
-from pyrogram import utils, types
+from pyrogram import utils
 from pyrogram.handlers import (
-    CallbackQueryHandler, MessageHandler, EditedMessageHandler, ErrorHandler, DeletedMessagesHandler,
+    CallbackQueryHandler, MessageHandler, EditedMessageHandler, DeletedMessagesHandler,
     UserStatusHandler, RawUpdateHandler, InlineQueryHandler, PollHandler,
     ChosenInlineResultHandler, ChatMemberUpdatedHandler, ChatJoinRequestHandler, StoryHandler
 )
@@ -61,7 +60,6 @@ class Dispatcher:
 
         self.handler_worker_tasks = []
         self.locks_list = []
-        self.error_handlers = []
 
         self.updates_queue = asyncio.Queue()
         self.groups = OrderedDict()
@@ -173,7 +171,6 @@ class Dispatcher:
 
             self.handler_worker_tasks.clear()
             self.groups.clear()
-            self.error_handlers.clear()
 
             log.info("Stopped %s HandlerTasks", self.client.workers)
 
@@ -183,14 +180,11 @@ class Dispatcher:
                 await lock.acquire()
 
             try:
-                if isinstance(handler, ErrorHandler):
-                    if handler not in self.error_handlers:
-                        self.error_handlers.append(handler)
-                else:
-                    if group not in self.groups:
-                        self.groups[group] = []
-                        self.groups = OrderedDict(sorted(self.groups.items()))
-                    self.groups[group].append(handler)
+                if group not in self.groups:
+                    self.groups[group] = []
+                    self.groups = OrderedDict(sorted(self.groups.items()))
+
+                self.groups[group].append(handler)
             finally:
                 for lock in self.locks_list:
                     lock.release()
@@ -203,21 +197,17 @@ class Dispatcher:
                 await lock.acquire()
 
             try:
-                if isinstance(handler, ErrorHandler):
-                    if handler not in self.error_handlers:
-                        raise ValueError(
-                            f"Error handler {handler} does not exist. Handler was not removed."
-                        )
-                    self.error_handlers.remove(handler)
-                else:
-                    if group not in self.groups:
-                        raise ValueError(f"Group {group} does not exist. Handler was not removed.")
-                    self.groups[group].remove(handler)
+                if group not in self.groups:
+                    raise ValueError(f"Group {group} does not exist. Handler was not removed.")
+
+                self.groups[group].remove(handler)
             finally:
                 for lock in self.locks_list:
                     lock.release()
 
-    async def handler_worker(self, lock: asyncio.Lock):
+        self.loop.create_task(fn())
+
+    async def handler_worker(self, lock):
         while True:
             packet = await self.updates_queue.get()
 
@@ -225,91 +215,53 @@ class Dispatcher:
                 break
 
             try:
-                await self._handle_packet(packet, lock)
+                update, users, chats = packet
+                parser = self.update_parsers.get(type(update), None)
+
+                parsed_update, handler_type = (
+                    await parser(update, users, chats)
+                    if parser is not None
+                    else (None, type(None))
+                )
+
+                async with lock:
+                    for group in self.groups.values():
+                        for handler in group:
+                            args = None
+
+                            if isinstance(handler, handler_type):
+                                try:
+                                    if await handler.check(self.client, parsed_update):
+                                        args = (parsed_update,)
+                                except Exception as e:
+                                    log.exception(e)
+                                    continue
+
+                            elif isinstance(handler, RawUpdateHandler):
+                                args = (update, users, chats)
+
+                            if args is None:
+                                continue
+
+                            try:
+                                if inspect.iscoroutinefunction(handler.callback):
+                                    await handler.callback(self.client, *args)
+                                else:
+                                    await self.loop.run_in_executor(
+                                        self.client.executor,
+                                        handler.callback,
+                                        self.client,
+                                        *args
+                                    )
+                            except pyrogram.StopPropagation:
+                                raise
+                            except pyrogram.ContinuePropagation:
+                                continue
+                            except Exception as e:
+                                log.exception(e)
+
+                            break
             except pyrogram.StopPropagation:
                 pass
             except Exception as e:
                 log.exception(e)
-            finally:
-                self.updates_queue.task_done()
-    
-    async def _handle_packet(self, packet, lock: asyncio.Lock):
-        update, users, chats = packet
-        parser = self.update_parsers.get(type(update))
-
-        parsed_update, handler_type = (
-            await parser(update, users, chats)
-            if parser is not None else (None, type(None))
-        )
-        async with lock:
-            await self._dispatch_to_handlers(update, users, chats, parsed_update, handler_type)
-
-
-    async def _dispatch_to_handlers(
-        self, update, users, chats, parsed_update, handler_type,
-    ):
-        for group in self.groups.values():
-            for handler in group:
-                args = await self._match_handler(
-                    handler, update, users, chats, parsed_update, handler_type,
-                )
-                if args is None:
-                    continue
-
-                try:
-                    await self._execute_handler(handler, *args)
-                except pyrogram.StopPropagation:
-                    raise
-                except pyrogram.ContinuePropagation:
-                    continue
-                except Exception as error:
-                    if parsed_update is not None:
-                        await self._handle_exception(parsed_update, error)
-                break
-
-    async def _match_handler(
-        self, handler, update, users, chats, parsed_update, handler_type,
-    ):
-        try:
-            if isinstance(handler, handler_type):
-                if await handler.check(self.client, parsed_update):
-                    return (parsed_update,)
-            elif isinstance(handler, RawUpdateHandler):
-                if await handler.check(self.client, update):
-                    return (update, users, chats)
-        except Exception as e:
-            log.exception(e)
-
-        return None
-
-    async def _execute_handler(self, handler, *args: Any):
-        if inspect.iscoroutinefunction(handler.callback):
-            await handler.callback(self.client, *args)
-        else:
-            await self.loop.run_in_executor(
-                self.client.executor,
-                handler.callback,
-                self.client,
-                *args
-            )
-
-    async def _handle_exception(
-        self, parsed_update: types.Update, exception: Exception,
-    ):
-        handled_error = False
-        for error_handler in self.error_handlers:
-            try:
-                if await error_handler.check(
-                    self.client, parsed_update, exception,
-                ):
-                    handled_error = True
-                    break
-            except pyrogram.StopPropagation:
-                raise
-            except pyrogram.ContinuePropagation:
-                continue
-            except Exception as inner_exception:
-                log.exception("Error in error handler: %s", inner_exception)
-
-        if not handled_error:
-            log.exception("Unhandled exception: %s", exception)
