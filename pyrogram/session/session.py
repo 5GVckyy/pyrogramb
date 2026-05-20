@@ -32,7 +32,6 @@ import pyrogram
 from pyrogram import raw
 from pyrogram.crypto import mtproto
 from pyrogram.errors import (
-    FloodPremiumWait,
     AuthKeyDuplicated,
     BadMsgNotification,
     FloodWait,
@@ -330,6 +329,7 @@ class Session:
         log.info("NetworkTask started")
 
         while True:
+            # FIX: Tangkap OSError di recv agar tidak crash saat koneksi putus tiba-tiba
             try:
                 packet = await self.connection.recv()
             except OSError:
@@ -382,6 +382,7 @@ class Session:
             await self.connection.send(payload)
         except OSError as e:
             self.results.pop(msg_id, None)
+            # FIX: Trigger reconnect saat send gagal karena koneksi tertutup
             if self.is_started.is_set():
                 self.client.loop.create_task(self.restart())
             raise e
@@ -456,7 +457,7 @@ class Session:
                     continue
 
                 return await self.send(query, timeout=timeout)
-            except (FloodWait, FloodPremiumWait) as e:
+            except FloodWait as e:
                 amount = e.value
 
                 if amount > sleep_threshold >= 0:
